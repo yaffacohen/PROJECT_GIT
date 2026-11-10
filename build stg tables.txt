@@ -1,0 +1,253 @@
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.cloud import bigquery
+
+# Project and Dataset settings
+PROJECT_ID = "ita-phuket-nonprod-data"
+DATASET = "QASH"
+client = bigquery.Client(project=PROJECT_ID)
+
+# Define base directory path relative to the current file location
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def get_full_path(file_name: str) -> str:
+    """Returns the absolute file path relative to the script directory."""
+    return os.path.join(BASE_DIR, file_name)
+
+def load_tables_from_txt(file_name: str) -> list:
+    """Reads a list of table names from a text file, ignoring empty lines and comments."""
+    file_path = get_full_path(file_name)
+    if not os.path.exists(file_path):
+        return []
+        
+    with open(file_path, "r", encoding="utf-8") as f:
+        tables = [
+            line.strip() 
+            for line in f 
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    return tables
+
+def read_sql_file(file_name: str) -> str:
+    """Reads a SQL file and injects PROJECT_ID and DATASET variables."""
+    file_path = get_full_path(file_name)
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return content.format(PROJECT_ID=PROJECT_ID, DATASET=DATASET)
+
+def load_single_category_tables(category_name: str, tables: list):
+    if not tables:
+        return
+        
+    clean_tables = []
+    prefix = f"{category_name}_"
+    for t in tables:
+        if t.startswith(prefix):
+            clean_tables.append(t[len(prefix):])
+        else:
+            clean_tables.append(t)
+            
+    sp_name = f"load_{category_name}_tables_sp"
+    sql = f"CALL `{PROJECT_ID}.{DATASET}.{sp_name}`(@tables)"
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("tables", "STRING", clean_tables)
+        ]
+    )
+    
+    print(f"Starting load for {category_name} tables: {clean_tables}")
+    client.query(sql, job_config=job_config).result()
+    print(f"Completed load for: {category_name}")
+    
+def run_load_procedures(onprem_tables: list, lkp_tables: list, gold_tables: list):
+    print("--- 1. Starting Load Procedures (Parallel) ---")
+    
+    tasks = [
+        ("onprem", onprem_tables),
+        ("lkp", lkp_tables),
+        ("gold", gold_tables)
+    ]
+    
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(load_single_category_tables, cat, tbls): cat 
+            for cat, tbls in tasks if tbls
+        }
+        
+        for future in as_completed(futures):
+            cat = futures[future]
+            try:
+                future.result()
+                print(f"Successfully finished category: {cat}")
+            except Exception as e:
+                print(f"Error loading category {cat}: {str(e)}")
+
+def create_mapping_tables():
+    print("\n--- 2. Creating Mapping Tables ---")
+    
+    lookup_sql = read_sql_file("create_lookup_mapping.sql")
+    mapping_enriched_sql = read_sql_file("create_key_dim_mapping_enriched.sql")
+    
+    client.query(lookup_sql).result()
+    print("Created lookup_mapping_table.")
+    
+    client.query(mapping_enriched_sql).result()
+    print("Created key_dim_mapping_enriched.")
+
+def process_single_enriched_table(source_table: str, mapping_data: list, all_columns: dict):
+    """
+    Generates an enriched table directly (e.g., onprem_enriched_tablename) 
+    without creating duplicate column names. Includes Row Count Assertion.
+    """
+    table_mappings = [m for m in mapping_data if m['source_table'] == source_table]
+    if not table_mappings:
+        return None
+    
+    table_cols = all_columns.get(source_table.lower(), set())
+    cols_to_exclude = {m['source_key_column'].lower() for m in table_mappings}
+    always_keep = {'sug_tik_key', 'anaf_key', 'ou_key'}
+    
+    existing_output_cols = set()
+    
+    base_columns = []
+    for c in sorted(list(table_cols)):
+        if c in always_keep or c.endswith('_ou_key') or c not in cols_to_exclude:
+            base_columns.append(f"s.{c}")
+            existing_output_cols.add(c.lower())
+    
+    v_columns_sql = ",\n    ".join(base_columns)
+    v_joins_sql = ""
+    v_select_fields_sql = ""
+
+    added_joins = set()
+    for m in table_mappings:
+        if m['is_running_key'] == 0:
+            dim_table = m['target_dim_table']
+            if not dim_table.startswith('lkp_'):
+                dim_table = f"lkp_{dim_table}"
+                
+            join_alias = f"dim_{m['source_key_column']}"
+            
+            if join_alias not in added_joins:
+                v_joins_sql += f"""
+                LEFT JOIN `{PROJECT_ID}.{DATASET}.{dim_table}` AS {join_alias}
+                    ON s.{m['source_key_column']} = {join_alias}.{m['target_key_column']}"""
+                added_joins.add(join_alias)
+
+            if m['target_id_column'] and m['target_id_alias']:
+                id_alias_lower = m['target_id_alias'].lower()
+                if id_alias_lower not in existing_output_cols:
+                    v_select_fields_sql += f",\n    {join_alias}.{m['target_id_column']} AS {m['target_id_alias']}"
+                    existing_output_cols.add(id_alias_lower)
+                    
+            if m['target_desc_column'] and m['target_desc_alias']:
+                desc_alias_lower = m['target_desc_alias'].lower()
+                if desc_alias_lower not in existing_output_cols:
+                    v_select_fields_sql += f",\n    {join_alias}.{m['target_desc_column']} AS {m['target_desc_alias']}"
+                    existing_output_cols.add(desc_alias_lower)
+
+    target_table_name = source_table.replace('onprem_', 'onprem_enriched_', 1)
+    prod_table_id = f"{PROJECT_ID}.{DATASET}.{target_table_name}"
+
+    create_query = f"""
+        CREATE OR REPLACE TABLE `{prod_table_id}` AS
+        SELECT 
+            {v_columns_sql} {v_select_fields_sql}
+        FROM `{PROJECT_ID}.{DATASET}.{source_table}` s
+        {v_joins_sql}
+    """
+    
+    # הרצת יצירת הטבלה
+    client.query(create_query).result()
+
+    # ----------------------------------------------------
+    # בדיקת הגנה (Assertion): השוואת שורות לפני ואחרי ההעשרה
+    # ----------------------------------------------------
+    assertion_query = f"""
+        SELECT 
+            (SELECT COUNT(*) FROM `{PROJECT_ID}.{DATASET}.{source_table}`) as src_cnt,
+            (SELECT COUNT(*) FROM `{prod_table_id}`) as enr_cnt
+    """
+    res = list(client.query(assertion_query).result())[0]
+    if res.src_cnt != res.enr_cnt:
+        raise AssertionError(
+            f"CRITICAL: Row count mismatch in table {target_table_name}! "
+            f"Source rows: {res.src_cnt}, Enriched rows: {res.enr_cnt}. "
+            f"This indicates duplicate keys in the lookup (lkp) tables causing row multiplication."
+        )
+
+    return prod_table_id
+
+def generate_enriched_tables(test_tables: list):
+    print("\n--- 3. Generating Enriched Tables (Python Engine) ---")
+    
+    mappings_query = f"""
+        SELECT * 
+        FROM `{PROJECT_ID}.{DATASET}.key_dim_mapping_enriched`
+        WHERE source_table IS NOT NULL 
+          AND CAST(needs_manual_review AS INT64) = 0 
+          AND target_dim_table IS NOT NULL
+    """
+    mapping_rows = list(client.query(mappings_query).result())
+    mapping_data = [dict(row) for row in mapping_rows]
+    all_unique_tables = list(set(m['source_table'] for m in mapping_data))
+
+    normalized_test_tables = set()
+    for t in test_tables:
+        t_lower = t.lower().strip()
+        if t_lower:
+            normalized_test_tables.add(t_lower)
+            if not t_lower.startswith("onprem_"):
+                normalized_test_tables.add(f"onprem_{t_lower}")
+
+    unique_tables = [
+        tbl for tbl in all_unique_tables 
+        if tbl.lower() in normalized_test_tables
+    ]
+
+    cols_query = f"""
+        SELECT LOWER(table_name) as table_name, LOWER(column_name) as column_name
+        FROM `{PROJECT_ID}.{DATASET}.INFORMATION_SCHEMA.COLUMNS`
+    """
+    all_columns = {}
+    for row in client.query(cols_query).result():
+        tbl = row['table_name']
+        if tbl not in all_columns:
+            all_columns[tbl] = set()
+        all_columns[tbl].add(row['column_name'])
+
+    print(f"Found {len(unique_tables)} tables to enrich. Starting parallel execution with Assertions...")
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(process_single_enriched_table, tbl, mapping_data, all_columns): tbl 
+            for tbl in unique_tables
+        }
+        
+        for future in as_completed(futures):
+            tbl = futures[future]
+            try:
+                result_table = future.result()
+                print(f"Successfully enriched & validated: {result_table}")
+            except Exception as e:
+                print(f"Error / Assertion Failed in {tbl}: {str(e)}")
+                raise e  # עצירת הריצה במקרה של כפילות
+
+if __name__ == "__main__":
+    test_tables = load_tables_from_txt("test_tables.txt")
+    lkp_tables = load_tables_from_txt("lkp_tables")
+    if not lkp_tables:
+        lkp_tables = load_tables_from_txt("lkp_tables.txt")
+
+    print(f"Loaded {len(test_tables)} test tables and {len(lkp_tables)} lkp tables from configuration.")
+
+    run_load_procedures(onprem_tables=test_tables, lkp_tables=lkp_tables, gold_tables=test_tables)
+    create_mapping_tables()
+    
+    generate_enriched_tables(test_tables)
+    
+    print("\n==================================================")
+    print("  ✅ כל תהליך הטעינה, ההעשרה ובדיקות השלמות הסתיים בהצלחה!")
+    print("==================================================")
